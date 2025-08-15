@@ -1,20 +1,49 @@
-local json = require 'json'
+local json = require 'libs/json'
 local socket = require "socket"
+local utf8 = require("utf8")
 local sock
 
+local globaltime = 0
 local input_text
 local input_image
 local input_image_SCALE = 16
 local IMAGE_MAX_WIDTH = 24
 local IMAGE_MAX_HEIGHT = 16
+local TIMEOUT = 12
 local messages
 local messages_offset
 local messages_height
+local send_ip_setting = "255.255.255.255"
+local send_ip = "255.255.255.255"
+local use_send_ip_setting = false
+local send_keep_alive = false
+local send_keep_alive_last = 0
+local keep_alives = {}
+local function keep_alives_count()
+	local count = 0
+	for i, con in pairs(keep_alives) do
+		if globaltime < con.last + TIMEOUT then 
+			count = count + 1
+		end
+	end
+	return count
+end
+local function keep_alives_add(author)
+	for i, con in pairs(keep_alives) do
+		if con.author == author then 
+			con.last = globaltime
+			return true
+		end
+	end
+	table.insert(keep_alives, {author=author, last=globaltime})
+end
+local on_receive_notify = false
 local PORT = 55544
-local VERSION = "0.5"
+local VERSION = "0.6"
 local myName
 local myRandomNumber
 local state
+local settings_selected_field = "myName"
 local themes = {}
 themes["original"] = {
 	color_text = {255,255,255,255},
@@ -22,13 +51,15 @@ themes["original"] = {
 	color_box_bg = {0,0,0,0},
 	color_background = {0,0,0,255},
 	color_text_author = {0,200,0,255},
+	color_text_warning = {255,200,0,255},
 }
 themes["green"] = {
 	color_text = {200,255,200,255},
 	color_ui = {0,255,0,255},
 	color_box_bg = {0,0,0,0},
 	color_background = {0,0,0,255},
-	color_text_author = {0,200,0,255},
+	color_text_author = {0,255,0,255},
+	color_text_warning = {255,200,0,255},
 }
 themes["sleek"] = {
 	color_text = {255,255,255,255},
@@ -36,6 +67,7 @@ themes["sleek"] = {
 	color_box_bg = {50,50,50,255},
 	color_background = {10,10,10,255},
 	color_text_author = {0,200,0,255},
+	color_text_warning = {255,200,0,255},
 }
 themes["sleekblue"] = {
 	color_text = {255,255,255,255},
@@ -43,6 +75,15 @@ themes["sleekblue"] = {
 	color_box_bg = {49,50,51,255},
 	color_background = {9,10,11,255},
 	color_text_author = {0,200,0,255},
+	color_text_warning = {255,200,0,255},
+}
+themes["scroll"] = {
+	color_text = {0,0,2,255},
+	color_ui = {255,200,0,255},
+	color_box_bg = {255,235,100,255},
+	color_background = {100,60,0,255},
+	color_text_author = {100,180,255,255},
+	color_text_warning = {255,150,150,255},
 }
 local theme = themes["original"]
 local activeTheme = "original"
@@ -59,9 +100,60 @@ local settings = {
 			if (activeTheme == "original") then activeTheme = "green"
 			elseif (activeTheme == "green") then activeTheme = "sleek"
 			elseif (activeTheme == "sleek") then activeTheme = "sleekblue"
-			elseif (activeTheme == "sleekblue") then activeTheme = "original"
+			elseif (activeTheme == "sleekblue") then activeTheme = "scroll"
+			elseif (activeTheme == "scroll") then activeTheme = "original"
 			end
 			theme = themes[activeTheme]
+		end,
+	},
+	{
+		text = function() return "IP: " .. send_ip_setting end,
+		activate = function()
+			settings_selected_field = "send_ip"
+		end,
+	},
+	{
+		text = function() 
+			if (use_send_ip_setting) then
+				return "use IP? Yes" 
+			else
+				return "use IP? No" 
+			end
+		end,
+		activate = function()
+			use_send_ip_setting = not use_send_ip_setting
+		end,
+	},
+	{
+		text = function() 
+			if (send_keep_alive) then
+				return "send KeepAlive? Yes" 
+			else
+				return "send KeepAlive? No" 
+			end
+		end,
+		activate = function()
+			send_keep_alive = not send_keep_alive
+		end,
+	},
+	{
+		text = function() 
+			if (os_name == "Windows" or os_name == "OS X") then
+				if (on_receive_notify) then
+					return "receive notify? Yes" 
+				else
+					return "receive notify? No" 
+				end
+			else
+				return ""
+			end
+		end,
+		activate = function()
+			if (os_name == "Windows" or os_name == "OS X") then
+				on_receive_notify = not on_receive_notify
+			else
+				on_receive_notify = false
+			end
 		end,
 	},
 	{
@@ -70,7 +162,9 @@ local settings = {
 			love.filesystem.write("settings.json", json.encode({
 				myName = myName,
 				activeTheme = activeTheme,
+				send_ip_setting = send_ip_setting,
 			}))
+			print("saved!")
 		end,
 	},
 }
@@ -78,13 +172,13 @@ local settings = {
 
 
 images = {
-    image = love.graphics.newImage("image.png"),
-    cog = love.graphics.newImage("cog.png"),
+    image = love.graphics.newImage("assets/image.png"),
+    cog = love.graphics.newImage("assets/cog.png"),
 }
 
 require 'gEngine'
 
-local bitser = require 'bitser'
+local bitser = require 'libs/bitser'
 
 function love.load()
 	sock = socket.udp()
@@ -93,6 +187,7 @@ function love.load()
 	sock:setoption("broadcast", true)
 
 	math.randomseed(os.time())
+	love.window.setDisplaySleepEnabled(true)
 
 	input_text = ""
 	input_image = {}
@@ -107,7 +202,8 @@ function love.load()
 
 	font = love.graphics.setNewFont(30, "normal")
 
-	if (love.system.getOS() == "Android") then
+	os_name = love.system.getOS()
+	if (os_name == "Android") then
 		love.window.setMode(1, 2)
 	end
 
@@ -126,6 +222,7 @@ function love.load()
     	local settings = json.decode(contents)
     	if settings.myName then myName = settings.myName end
     	if settings.activeTheme then activeTheme = settings.activeTheme; theme = themes[activeTheme] or themes["original"] end
+    	if settings.send_ip_setting then send_ip_setting = settings.send_ip_setting end
     end
 end
 
@@ -138,6 +235,9 @@ local function addMessage(msg, author, type)
 	else
 		print(author .. " - " ..type)
 	end
+	-- if (on_receive_notify and not love.window.hasFocus()) then
+		love.window.requestAttention()
+	-- end
 end
 
 local function trySendImage()
@@ -148,12 +248,17 @@ local function trySendImage()
 	if not isImageEmpty then
 		-- addMessage(input_text)
 		if (myName == "") then myName = tostring(myRandomNumber) end
-        sock:sendto("superlanchat;author="..myName..";type=image/bw;content="..bitser.dumps(input_image), "255.255.255.255", PORT)
+		if (use_send_ip_setting) then send_ip = send_ip_setting end
+		if (send_ip == "") then send_ip = "255.255.255.255" end
+		if (send_ip == "255.255.255.255") then sock:setoption("broadcast", true) else sock:setoption("broadcast", false) end
+		if (send_ip ~= "255.255.255.255") then addMessage(input_image, myName, "image/bw") end
+        sock:sendto("superlanchat;author="..myName..";type=image/bw;content="..bitser.dumps(input_image), send_ip, PORT)
 		input_image = {}
 	end
 end
 
 function love.update(dt)
+	globaltime = globaltime + dt
 	local msg, address, port = sock:receivefrom()
     if (msg ~= nil) then
     	if (string.sub(msg, 1, 13) == "superlanchat;") then
@@ -186,29 +291,48 @@ function love.update(dt)
     		-- 	-- print (string.sub(msg, endIndex+1))
     		-- 	content = string.sub(msg, endIndex+1)
     		-- end
+    		if (author) then
+    			keep_alives_add(author)
+    		end
     		if (type == "image/bw" and content) then
 				addMessage(bitser.loads(content), author, type)
     		elseif (type == "text/plain" and content) then
-				addMessage(content, author, "text/plain")
+    			if (utf8.len(content) ~= nil) then
+					addMessage(content, author, "text/plain")
+				else
+					addMessage("invalid utf8 text", author, "unknown")
+				end
     		elseif (content) then
-				addMessage("unknown", author, "unknown")
+				addMessage("unknown type", author, "unknown")
 			end
     	end
+    end
+    if (globaltime > send_keep_alive_last + 5 and send_keep_alive) then
+    	send_keep_alive_last = globaltime
+    	if (myName == "") then myName = tostring(myRandomNumber) end
+		if (use_send_ip_setting) then send_ip = send_ip_setting end
+		if (send_ip == "") then send_ip = "255.255.255.255" end
+		if (send_ip == "255.255.255.255") then sock:setoption("broadcast", true) else sock:setoption("broadcast", false) end
+        sock:sendto("superlanchat;author="..myName..";type=keepalive", send_ip, PORT)
     end
 end
 
 function love.mousemoved( x, y, dx, dy, istouch )
-	if (state == "input-image" and love.mouse.isDown(1)) then
+	if (state == "input-image" and (love.mouse.isDown(1) or love.mouse.isDown(2))) then
 		local scale = math.min(input_image_SCALE, (screenWidth - 65)/IMAGE_MAX_WIDTH)
 		local x = math.floor((x - 10 + scale)/scale)
 		local y = math.floor((y - 10 + scale)/scale)
 		if (x <= IMAGE_MAX_WIDTH and y <= IMAGE_MAX_HEIGHT) then 
 			if (not input_image[x]) then input_image[x] = {} end
-			input_image[x][y] = 1
+			if (love.mouse.isDown(2)) then
+				input_image[x][y] = 0
+			else
+				input_image[x][y] = 1
+			end
 		end
 	end
 	if (state ~= "settings" and love.mouse.isDown(1) and y > messages_height) then
-		messages_offset = messages_offset - dy*0.01
+		messages_offset = messages_offset - dy*0.014
 		if (messages_offset > #messages-1+0.9) then messages_offset = #messages-1 end
 		if (messages_offset < 0) then messages_offset = 0 end
 	end
@@ -225,7 +349,11 @@ function love.mousepressed(x, y)
 		if (state == "input-text") then
 			input_text = ""
 		elseif (state == "settings") then
-			myName = ""
+			if (settings_selected_field == "myName") then
+				myName = ""
+			else
+				send_ip_setting = ""
+			end
 		elseif (state == "input-image") then
 			input_image = {}
 		end
@@ -240,6 +368,7 @@ function love.mousepressed(x, y)
 	elseif (x > screenWidth - 50 and y < 140) then
 		if (state == "input-text" or state == "input-image") then
 			state = "settings"
+			settings_selected_field = "myName"
 			love.keyboard.setTextInput(true)
 		elseif (state == "settings") then
 			state = "input-text"
@@ -257,6 +386,26 @@ function love.mousepressed(x, y)
 			settings[1].activate()
 		elseif (x < screenWidth - 50 and y > 110+lineHeight*2 and y < 110+lineHeight*3) then
 			settings[2].activate()
+		elseif (x < screenWidth - 50 and y > 115+lineHeight*3 and y < 115+lineHeight*4) then
+			settings[3].activate()
+		elseif (x < screenWidth - 50 and y > 120+lineHeight*4 and y < 120+lineHeight*5) then
+			settings[4].activate()
+		elseif (x < screenWidth - 50 and y > 125+lineHeight*5 and y < 125+lineHeight*6) then
+			settings[5].activate()
+		elseif (x < screenWidth - 50 and y > 130+lineHeight*6 and y < 130+lineHeight*7) then
+			settings[6].activate()
+		end
+	end
+end
+
+local function textInput(text)
+	if (state == "input-text") then
+		input_text = input_text .. text
+	elseif (state == "settings") then
+		if (settings_selected_field == "myName") then
+			myName = myName .. text
+		else
+			send_ip_setting = send_ip_setting .. text
 		end
 	end
 end
@@ -270,19 +419,43 @@ function love.keypressed(key, scancode, isrepeat)
 			if input_text ~= "" then
 				-- addMessage(input_text)
 				if (myName == "") then myName = tostring(myRandomNumber) end
-	            sock:sendto("superlanchat;author="..myName..";type=text/plain;content="..input_text, "255.255.255.255", PORT)
+				if (use_send_ip_setting) then send_ip = send_ip_setting end
+				if (send_ip == "") then send_ip = "255.255.255.255" end
+				if (send_ip == "255.255.255.255") then sock:setoption("broadcast", true) else sock:setoption("broadcast", false) end
+	            if (send_ip ~= "255.255.255.255") then addMessage(input_text, myName, "text/plain") end
+	            sock:sendto("superlanchat;author="..myName..";type=text/plain;content="..input_text, send_ip, PORT)
 				input_text = ""
 			end
 		end
 	elseif (state == "settings") then
 		if key == "backspace" then
-			myName = myName:sub(1, -2)
+			if (settings_selected_field == "myName") then
+				myName = myName:sub(1, -2)
+			else
+				send_ip_setting = send_ip_setting:sub(1, -2)
+			end
 		end
 		if key == "return" then
 		end
 	elseif (state == "input-image") then
 		if key == "return" then
 			trySendImage()
+		end
+	end
+
+	local osString = love.system.getOS()
+	local control
+	if osString == "OS X" then
+		control = love.keyboard.isDown("lgui","rgui")
+	elseif osString == "Windows" or osString == "Linux" then
+		control = love.keyboard.isDown("lctrl","rctrl")
+	end
+	if control then
+		-- if key == "c" then
+		-- 	if buffer then love.system.setClipboardText(buffer) end
+		-- end
+		if key == "v" then
+			textInput(love.system.getClipboardText())
 		end
 	end
 
@@ -298,11 +471,7 @@ function love.keyreleased( key, scancode )
 end
 
 function love.textinput(text)
-	if (state == "input-text") then
-		input_text = input_text .. text
-	elseif (state == "settings") then
-		myName = myName .. text
-	end
+	textInput(text)
 end
 
 function love.resize(w, h)
@@ -390,6 +559,16 @@ function love.draw()
 			setColor(theme.color_text_author)
 			love.graphics.print("looking at past messages", screenWidth - 50 - font:getWidth("looking at past messages")/2, height, 0, 0.5)
 		end
+		if (send_ip_setting ~= "255.255.255.255" and send_ip_setting ~= "" and use_send_ip_setting) then
+			setColor(theme.color_text_warning)
+			local offset = 0
+			if (math.floor(messages_offset) > 0) then offset = -15 end
+			love.graphics.print("DM sending mode", screenWidth - 50 - font:getWidth("DM sending mode")/2, height + offset, 0, 0.5)
+		end
+		if (keep_alives_count() > 0) then
+			setColor(theme.color_ui)
+			love.graphics.print("#people " .. tostring(keep_alives_count()), 10, height - 15, 0, 0.5)
+		end
 		for i = 1, 12 do
 			local j = #messages - i + 1 - math.floor(messages_offset)
 			if (not messages[j]) then
@@ -402,26 +581,26 @@ function love.draw()
 			end
 			previousAuthor = messages[j].author
 			setColor(theme.color_text)
-			local lines = 1
+			local extraHeight = lineHeight
 			local lines_text = {""}
 			if (messages[j].type == "text/plain") then
 				lines_text = getLines(messages[j].content, screenWidth - 20)
-				lines = #lines_text
+				extraHeight = #lines_text*lineHeight
 			elseif (messages[j].type == "image/bw") then
-				lines = 3
+				extraHeight = 6*IMAGE_MAX_HEIGHT + 10
 			elseif (messages[j].type == "unknown") then
 				setColor(theme.color_ui)
-				lines_text = getLines("unknown type", screenWidth - 60)
-				lines = #lines_text
+				lines_text = getLines(messages[j].content, screenWidth - 60)
+				extraHeight = #lines_text*lineHeight
 			end
-			if lines == 0 then lines = 0.2 end
+			if extraHeight == 0 then extraHeight = 0.2*lineHeight end
 			setColor(theme.color_ui)
-			drawBox(5, height, screenWidth - 10, lines*lineHeight)
+			drawBox(5, height, screenWidth - 10, extraHeight)
 			setColor(theme.color_text)
 			if (messages[j].type == "unknown") then setColor(theme.color_ui) end
 			if (messages[j].type == "image/bw") then drawCanvas(messages[j].content or {}, 10, height + 5, 6) end
 			drawText(lines_text, 10, height)
-			height = height + lines*lineHeight + 5
+			height = height + extraHeight + 5
 			-- love.graphics.printf(messages[j] or "error", 10, 10 + offset, screenWidth - 20, 'left', 0, 1)
 		end
 	else -- settings
